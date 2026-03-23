@@ -1,23 +1,25 @@
 """
-PostureGuard - macOS Posture Monitor with GUI
-Uses MediaPipe PoseLandmarker via webcam to detect slouching.
-Features: live camera preview, visual calibration, macOS notifications, slouch tracking.
+PostureGuard v2 — Enhanced macOS Posture Monitor
+Features: live skeleton overlay, multiple posture types, break reminders,
+daily score, heatmap, CSV export, achievements, focus mode, keyboard shortcuts.
 """
 
 from __future__ import annotations
 
+import csv
 import cv2
 import mediapipe as mp
 import numpy as np
 import threading
 import time
 import json
+import math
 import os
 import subprocess
 import sys
 import urllib.request
 from datetime import datetime, timedelta
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional
 
@@ -25,29 +27,70 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QCheckBox, QTabWidget,
     QFrame, QProgressBar, QScrollArea, QSystemTrayIcon, QMenu,
-    QSizePolicy, QSpacerItem, QGroupBox
+    QGroupBox, QFileDialog, QSpinBox, QComboBox
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize
-from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont, QColor, QPainter, QPen, QAction
+from PyQt6.QtGui import (
+    QImage, QPixmap, QIcon, QFont, QColor, QPainter, QPen,
+    QAction, QKeySequence, QShortcut, QBrush, QLinearGradient
+)
 
 
 # ─────────────────────────────────────────────
-# Model Download
+# Constants
 # ─────────────────────────────────────────────
 
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
 MODEL_FILENAME = "pose_landmarker_lite.task"
 DATA_DIR = os.path.expanduser("~/.postureguard")
 
+# MediaPipe landmark indices
+NOSE = 0
+LEFT_EYE = 2
+RIGHT_EYE = 5
+LEFT_EAR = 7
+RIGHT_EAR = 8
+LEFT_SHOULDER = 11
+RIGHT_SHOULDER = 12
+LEFT_ELBOW = 13
+RIGHT_ELBOW = 14
+LEFT_WRIST = 15
+RIGHT_WRIST = 16
+LEFT_HIP = 23
+RIGHT_HIP = 24
+
+# Skeleton connections for drawing
+SKELETON_CONNECTIONS = [
+    (NOSE, LEFT_EYE), (NOSE, RIGHT_EYE),
+    (LEFT_EYE, LEFT_EAR), (RIGHT_EYE, RIGHT_EAR),
+    (LEFT_SHOULDER, RIGHT_SHOULDER),
+    (LEFT_SHOULDER, LEFT_ELBOW), (LEFT_ELBOW, LEFT_WRIST),
+    (RIGHT_SHOULDER, RIGHT_ELBOW), (RIGHT_ELBOW, RIGHT_WRIST),
+    (LEFT_SHOULDER, LEFT_HIP), (RIGHT_SHOULDER, RIGHT_HIP),
+    (LEFT_HIP, RIGHT_HIP),
+]
+
+# Achievement definitions
+ACHIEVEMENTS = [
+    {"id": "first_hour", "name": "First Hour", "desc": "1 hour of good posture in a day", "icon": "🥉", "threshold_seconds": 3600},
+    {"id": "two_hours", "name": "Iron Spine", "desc": "2 hours of good posture in a day", "icon": "🥈", "threshold_seconds": 7200},
+    {"id": "four_hours", "name": "Posture Master", "desc": "4 hours of good posture in a day", "icon": "🥇", "threshold_seconds": 14400},
+    {"id": "streak_3", "name": "Hat Trick", "desc": "3-day streak with <10 min slouching", "icon": "🔥", "threshold_days": 3},
+    {"id": "streak_7", "name": "Week Warrior", "desc": "7-day streak with <10 min slouching", "icon": "⚡", "threshold_days": 7},
+    {"id": "streak_30", "name": "Legendary", "desc": "30-day streak with <10 min slouching", "icon": "👑", "threshold_days": 30},
+    {"id": "perfect_day", "name": "Perfect Day", "desc": "Zero slouch events in a full day", "icon": "✨", "threshold_zero": True},
+    {"id": "no_slouch_1h", "name": "Focused Hour", "desc": "1 hour monitoring with zero slouching", "icon": "🎯", "threshold_clean_hour": True},
+]
+
 
 def ensure_model() -> str:
     os.makedirs(DATA_DIR, exist_ok=True)
-    model_path = os.path.join(DATA_DIR, MODEL_FILENAME)
-    if not os.path.exists(model_path):
-        print("📥 Downloading pose model (first run only)...")
-        urllib.request.urlretrieve(MODEL_URL, model_path)
-        print(f"✅ Model saved to {model_path}")
-    return model_path
+    path = os.path.join(DATA_DIR, MODEL_FILENAME)
+    if not os.path.exists(path):
+        print("📥 Downloading pose model...")
+        urllib.request.urlretrieve(MODEL_URL, path)
+        print("✅ Model downloaded.")
+    return path
 
 
 # ─────────────────────────────────────────────
@@ -58,15 +101,14 @@ def ensure_model() -> str:
 class SlouchEvent:
     timestamp: str
     duration_seconds: float
+    posture_type: str = "general"  # general, forward_lean, head_tilt, shoulder_asymmetry
 
     @property
     def formatted_duration(self) -> str:
         m, s = divmod(int(self.duration_seconds), 60)
         h, m = divmod(m, 60)
-        if h > 0:
-            return f"{h}h {m}m"
-        if m > 0:
-            return f"{m}m {s}s"
+        if h: return f"{h}h {m}m"
+        if m: return f"{m}m {s}s"
         return f"{s}s"
 
 
@@ -74,10 +116,20 @@ class SlouchEvent:
 class Preferences:
     enable_notification: bool = True
     enable_sound: bool = True
-    sensitivity: float = 0.06
+    sensitivity: float = 0.07
     cooldown_seconds: int = 30
+    break_interval_minutes: int = 30
+    break_reminders_enabled: bool = True
+    focus_mode: bool = False
+    show_skeleton: bool = True
+    detect_head_tilt: bool = True
+    detect_forward_lean: bool = True
+    detect_shoulder_asymmetry: bool = True
+    head_tilt_threshold: float = 0.08
+    shoulder_asym_threshold: float = 0.05
 
     def save(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
         with open(os.path.join(DATA_DIR, "prefs.json"), "w") as f:
             json.dump(asdict(self), f, indent=2)
 
@@ -85,42 +137,98 @@ class Preferences:
     def load(cls) -> Preferences:
         try:
             with open(os.path.join(DATA_DIR, "prefs.json")) as f:
-                return cls(**json.load(f))
+                data = json.load(f)
+                # Handle missing keys from older prefs files
+                return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         except (FileNotFoundError, json.JSONDecodeError, TypeError):
             return cls()
 
 
 # ─────────────────────────────────────────────
-# Posture Logger
+# Posture Logger + Achievements + Heatmap
 # ─────────────────────────────────────────────
 
 class PostureLogger:
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
         self.log_path = os.path.join(DATA_DIR, "posture_log.json")
+        self.achievements_path = os.path.join(DATA_DIR, "achievements.json")
         self.events: list[SlouchEvent] = self._load()
+        self.unlocked_achievements: list[str] = self._load_achievements()
+        self.monitoring_start: Optional[float] = None
+        self.total_monitoring_seconds: float = 0
+        self.good_posture_seconds: float = 0
+        self._last_good_check: float = 0
 
-    def log(self, duration: float):
+    def start_session(self):
+        self.monitoring_start = time.time()
+        self._last_good_check = time.time()
+
+    def tick_good_posture(self):
+        now = time.time()
+        if self._last_good_check > 0:
+            self.good_posture_seconds += now - self._last_good_check
+        self._last_good_check = now
+
+    def tick_bad_posture(self):
+        self._last_good_check = time.time()
+
+    def stop_session(self):
+        if self.monitoring_start:
+            self.total_monitoring_seconds += time.time() - self.monitoring_start
+            self.monitoring_start = None
+
+    def log(self, duration: float, posture_type: str = "general"):
         if duration < 3.0:
             return
         self.events.append(SlouchEvent(
             timestamp=datetime.now().isoformat(),
             duration_seconds=round(duration, 1),
+            posture_type=posture_type,
         ))
         self._save()
+        self._check_achievements()
+
+    def daily_score(self) -> float:
+        """Returns percentage of good posture time (0-100)."""
+        total = self.total_monitoring_seconds
+        if total < 60:
+            return 100.0
+        good = self.good_posture_seconds
+        return min(100.0, max(0.0, (good / total) * 100))
 
     def today_stats(self) -> tuple[int, float]:
         today = datetime.now().date()
-        today_events = [e for e in self.events if datetime.fromisoformat(e.timestamp).date() == today]
-        return len(today_events), sum(e.duration_seconds for e in today_events)
+        te = [e for e in self.events if datetime.fromisoformat(e.timestamp).date() == today]
+        return len(te), sum(e.duration_seconds for e in te)
 
     def weekly_stats(self) -> list[tuple[str, int, float]]:
         results = []
         for i in range(6, -1, -1):
             day = datetime.now().date() - timedelta(days=i)
-            day_events = [e for e in self.events if datetime.fromisoformat(e.timestamp).date() == day]
-            results.append((day.strftime("%a"), len(day_events), sum(e.duration_seconds for e in day_events)))
+            de = [e for e in self.events if datetime.fromisoformat(e.timestamp).date() == day]
+            results.append((day.strftime("%a"), len(de), sum(e.duration_seconds for e in de)))
         return results
+
+    def hourly_heatmap(self) -> list[float]:
+        """Returns 24 values (one per hour) of total slouch seconds for today."""
+        today = datetime.now().date()
+        hours = [0.0] * 24
+        for e in self.events:
+            dt = datetime.fromisoformat(e.timestamp)
+            if dt.date() == today:
+                hours[dt.hour] += e.duration_seconds
+        return hours
+
+    def posture_type_breakdown(self) -> dict[str, float]:
+        """Today's slouching broken down by type."""
+        today = datetime.now().date()
+        breakdown: dict[str, float] = {}
+        for e in self.events:
+            if datetime.fromisoformat(e.timestamp).date() == today:
+                t = e.posture_type or "general"
+                breakdown[t] = breakdown.get(t, 0) + e.duration_seconds
+        return breakdown
 
     def today_events(self) -> list[SlouchEvent]:
         today = datetime.now().date()
@@ -128,7 +236,81 @@ class PostureLogger:
 
     def clear(self):
         self.events.clear()
+        self.unlocked_achievements.clear()
+        self.good_posture_seconds = 0
+        self.total_monitoring_seconds = 0
         self._save()
+        self._save_achievements()
+
+    def export_csv(self, filepath: str):
+        with open(filepath, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Duration (seconds)", "Posture Type"])
+            for e in self.events:
+                writer.writerow([e.timestamp, e.duration_seconds, e.posture_type])
+
+    def streak_days(self) -> int:
+        """Count consecutive days with <10 min slouching, only counting days the app was used."""
+        # First, find all days that have any logged events (proof the app was running)
+        active_days = set()
+        for e in self.events:
+            active_days.add(datetime.fromisoformat(e.timestamp).date())
+        # Also count today if we're currently monitoring (even with 0 slouches)
+        if self.monitoring_start is not None:
+            active_days.add(datetime.now().date())
+
+        streak = 0
+        for i in range(0, 60):
+            day = datetime.now().date() - timedelta(days=i)
+            if day not in active_days:
+                # Day with no app usage — skip today (might still be building data)
+                # but break the streak for past days
+                if i == 0:
+                    continue  # give today a pass, user might have just started
+                break
+
+            de = [e for e in self.events if datetime.fromisoformat(e.timestamp).date() == day]
+            total = sum(e.duration_seconds for e in de)
+            if total < 600:  # < 10 min
+                streak += 1
+            else:
+                break
+        return streak
+
+    def _check_achievements(self):
+        newly_unlocked = []
+        for ach in ACHIEVEMENTS:
+            if ach["id"] in self.unlocked_achievements:
+                continue
+
+            unlocked = False
+            if "threshold_seconds" in ach:
+                if self.good_posture_seconds >= ach["threshold_seconds"]:
+                    unlocked = True
+            elif "threshold_days" in ach:
+                if self.streak_days() >= ach["threshold_days"]:
+                    unlocked = True
+            elif "threshold_zero" in ach:
+                count, _ = self.today_stats()
+                if count == 0 and self.total_monitoring_seconds > 3600:
+                    unlocked = True
+            elif "threshold_clean_hour" in ach:
+                if self.good_posture_seconds >= 3600:
+                    count, _ = self.today_stats()
+                    if count == 0:
+                        unlocked = True
+
+            if unlocked:
+                self.unlocked_achievements.append(ach["id"])
+                newly_unlocked.append(ach)
+
+        if newly_unlocked:
+            self._save_achievements()
+            for ach in newly_unlocked:
+                subprocess.run(["osascript", "-e",
+                    f'display notification "Achievement: {ach["name"]} — {ach["desc"]}" '
+                    f'with title "PostureGuard {ach["icon"]}" sound name "Glass"'
+                ], capture_output=True)
 
     def _save(self):
         cutoff = datetime.now() - timedelta(days=30)
@@ -139,30 +321,42 @@ class PostureLogger:
     def _load(self) -> list[SlouchEvent]:
         try:
             with open(self.log_path) as f:
-                return [SlouchEvent(**d) for d in json.load(f)]
+                data = json.load(f)
+                events = []
+                for d in data:
+                    if "posture_type" not in d:
+                        d["posture_type"] = "general"
+                    events.append(SlouchEvent(**d))
+                return events
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def _save_achievements(self):
+        with open(self.achievements_path, "w") as f:
+            json.dump(self.unlocked_achievements, f)
+
+    def _load_achievements(self) -> list[str]:
+        try:
+            with open(self.achievements_path) as f:
+                return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return []
 
 
 # ─────────────────────────────────────────────
-# Signal Bridge (thread-safe updates to GUI)
+# Signal Bridge
 # ─────────────────────────────────────────────
 
 class MonitorSignals(QObject):
-    state_changed = pyqtSignal(str, float)       # state, deviation
-    frame_ready = pyqtSignal(np.ndarray)          # BGR frame for preview
-    calibration_progress = pyqtSignal(int, int)   # current, total
-    log_message = pyqtSignal(str)                 # log text
+    state_changed = pyqtSignal(str, float, str)   # state, deviation, posture_type
+    frame_ready = pyqtSignal(np.ndarray)
+    calibration_progress = pyqtSignal(int, int)
+    log_message = pyqtSignal(str)
 
 
 # ─────────────────────────────────────────────
-# Posture Monitor
+# Posture Monitor — Multi-type Detection
 # ─────────────────────────────────────────────
-
-NOSE = 0
-LEFT_SHOULDER = 11
-RIGHT_SHOULDER = 12
-
 
 class PostureMonitor:
     def __init__(self, prefs: Preferences, logger: PostureLogger, model_path: str):
@@ -175,15 +369,29 @@ class PostureMonitor:
         self.calibrated = False
         self.state = "inactive"
         self.current_deviation = 0.0
+        self.current_posture_type = ""
 
-        self.calibration_samples: list[float] = []
-        self.baseline_ratio = 0.0
+        self.calibration_samples: list[dict] = []
+        self.baseline: dict = {}
         self.calibration_count = 20
 
         self.slouch_start: Optional[float] = None
+        self.slouch_type: str = "general"
         self.last_alert_time: float = 0
-
         self._thread: Optional[threading.Thread] = None
+
+        # ── Smoothing & grace period ──
+        # Rolling buffer of recent metrics (smooths out noise from scratching, glancing, etc.)
+        self._metrics_buffer: list[dict] = []
+        self._buffer_size = 8  # average over ~1 second of frames at 0.12s interval
+
+        # Confirmation window: bad posture must persist for N seconds before triggering
+        self._bad_posture_since: Optional[float] = None  # when bad posture first appeared
+        self._confirmation_seconds = 4.0  # must be bad for this long before it counts
+
+        # Grace period: brief good frames during a slouch don't reset the slouch
+        self._good_frames_in_slouch = 0
+        self._grace_frames = 5  # need this many consecutive good frames to end a slouch
 
     def start(self):
         if self.running:
@@ -192,25 +400,30 @@ class PostureMonitor:
         self.calibrated = False
         self.calibration_samples.clear()
         self._set_state("calibrating")
+        self.logger.start_session()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
     def stop(self):
         self.running = False
         if self.slouch_start is not None:
-            self.logger.log(time.time() - self.slouch_start)
+            self.logger.log(time.time() - self.slouch_start, self.slouch_type)
             self.slouch_start = None
+        self.logger.stop_session()
         self._set_state("inactive")
 
     def recalibrate(self):
         self.calibrated = False
         self.calibration_samples.clear()
+        self._metrics_buffer.clear()
+        self._bad_posture_since = None
+        self._good_frames_in_slouch = 0
         self._set_state("calibrating")
 
     def _run_loop(self):
         os.environ["OPENCV_AVFOUNDATION_SKIP_AUTH"] = "1"
-
         self.signals.log_message.emit("📷 Opening camera...")
+
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             self.signals.log_message.emit("❌ Cannot open camera!")
@@ -218,11 +431,6 @@ class PostureMonitor:
             self.running = False
             return
 
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.signals.log_message.emit(f"✅ Camera: {w}x{h}")
-
-        # Set up MediaPipe
         self.signals.log_message.emit("🧠 Loading pose model...")
         BaseOptions = mp.tasks.BaseOptions
         PoseLandmarker = mp.tasks.vision.PoseLandmarker
@@ -236,12 +444,11 @@ class PostureMonitor:
             min_pose_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-
         landmarker = PoseLandmarker.create_from_options(options)
-        self.signals.log_message.emit("✅ Pose model loaded!")
+        self.signals.log_message.emit("✅ Ready!")
 
-        frame_timestamp_ms = 0
-        check_interval = 0.15  # ~7 fps for smooth preview
+        frame_ts = 0
+        interval = 0.12
 
         try:
             while self.running:
@@ -250,124 +457,215 @@ class PostureMonitor:
                     time.sleep(0.05)
                     continue
 
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                frame_ts += int(interval * 1000)
+                result = landmarker.detect_for_video(mp_image, frame_ts)
 
-                frame_timestamp_ms += int(check_interval * 1000)
-                result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
-
-                # Draw landmarks on frame for preview
-                display_frame = frame.copy()
+                display = frame.copy()
 
                 if result.pose_landmarks and len(result.pose_landmarks) > 0:
-                    landmarks = result.pose_landmarks[0]
-                    display_frame = self._draw_landmarks(display_frame, landmarks)
-                    self._process_landmarks(landmarks)
+                    lms = result.pose_landmarks[0]
+                    if self.prefs.show_skeleton:
+                        display = self._draw_skeleton(display, lms)
+                    self._analyze_posture(lms)
                 else:
                     self._set_state("no_person")
 
-                # Send frame to GUI
-                self.signals.frame_ready.emit(display_frame)
-                time.sleep(check_interval)
+                self.signals.frame_ready.emit(display)
+                time.sleep(interval)
         except Exception as e:
-            self.signals.log_message.emit(f"❌ Error: {e}")
+            self.signals.log_message.emit(f"❌ {e}")
         finally:
             landmarker.close()
             cap.release()
-            self.signals.log_message.emit("🛑 Camera stopped.")
 
-    def _draw_landmarks(self, frame: np.ndarray, landmarks) -> np.ndarray:
+    def _draw_skeleton(self, frame: np.ndarray, landmarks) -> np.ndarray:
         h, w = frame.shape[:2]
 
-        nose = landmarks[NOSE]
-        l_shoulder = landmarks[LEFT_SHOULDER]
-        r_shoulder = landmarks[RIGHT_SHOULDER]
+        # Draw connections
+        for i1, i2 in SKELETON_CONNECTIONS:
+            lm1, lm2 = landmarks[i1], landmarks[i2]
+            if lm1.visibility > 0.4 and lm2.visibility > 0.4:
+                p1 = (int(lm1.x * w), int(lm1.y * h))
+                p2 = (int(lm2.x * w), int(lm2.y * h))
 
-        # Draw key points
-        points = [
-            (nose, (0, 255, 200)),        # cyan-green for nose
-            (l_shoulder, (255, 180, 0)),   # orange for shoulders
-            (r_shoulder, (255, 180, 0)),
-        ]
+                if self.state == "slouching":
+                    # Color by posture type
+                    type_colors = {
+                        "Forward Lean":     (0, 80, 255),   # red
+                        "Head Tilt":        (0, 140, 255),  # orange
+                        "Uneven Shoulders": (0, 100, 230),  # deep orange
+                    }
+                    color = type_colors.get(self.current_posture_type, (0, 80, 255))
+                elif self.state == "good":
+                    color = (0, 230, 120)  # green
+                else:
+                    color = (200, 200, 200)  # gray
+                cv2.line(frame, p1, p2, color, 2, cv2.LINE_AA)
 
-        for lm, color in points:
-            if lm.visibility > 0.5:
+        # Draw joints
+        key_joints = [NOSE, LEFT_EYE, RIGHT_EYE, LEFT_EAR, RIGHT_EAR,
+                      LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW,
+                      LEFT_WRIST, RIGHT_WRIST, LEFT_HIP, RIGHT_HIP]
+        for idx in key_joints:
+            lm = landmarks[idx]
+            if lm.visibility > 0.4:
                 cx, cy = int(lm.x * w), int(lm.y * h)
-                cv2.circle(frame, (cx, cy), 8, color, -1)
-                cv2.circle(frame, (cx, cy), 10, (255, 255, 255), 2)
-
-        # Draw shoulder line
-        if l_shoulder.visibility > 0.5 and r_shoulder.visibility > 0.5:
-            p1 = (int(l_shoulder.x * w), int(l_shoulder.y * h))
-            p2 = (int(r_shoulder.x * w), int(r_shoulder.y * h))
-            cv2.line(frame, p1, p2, (255, 180, 0), 3)
-
-            # Draw midpoint to nose line
-            mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
-            nose_pt = (int(nose.x * w), int(nose.y * h))
-
-            line_color = (0, 255, 100) if self.state == "good" else (0, 100, 255) if self.state == "slouching" else (200, 200, 200)
-            cv2.line(frame, mid, nose_pt, line_color, 3)
+                cv2.circle(frame, (cx, cy), 5, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(frame, (cx, cy), 7, (100, 200, 255), 1, cv2.LINE_AA)
 
         # Status overlay
-        status_colors = {
-            "good": (0, 200, 80),
-            "slouching": (0, 80, 255),
-            "calibrating": (0, 180, 255),
-            "no_person": (128, 128, 128),
-            "inactive": (128, 128, 128),
-        }
-        color = status_colors.get(self.state, (200, 200, 200))
-
-        label = self.state.upper()
         if self.state == "slouching":
-            label = f"SLOUCHING (dev: {self.current_deviation:.3f})"
+            type_labels = {
+                "Forward Lean":      "FORWARD LEAN",
+                "Head Tilt":         "HEAD TILT",
+                "Uneven Shoulders":  "UNEVEN SHOULDERS",
+            }
+            label = type_labels.get(self.current_posture_type, "BAD POSTURE")
+            color = (0, 80, 255)
         elif self.state == "calibrating":
             label = f"CALIBRATING ({len(self.calibration_samples)}/{self.calibration_count})"
+            color = (0, 180, 255)
+        elif self.state == "good":
+            label = "GOOD POSTURE"
+            color = (0, 200, 80)
+        else:
+            label = self.state.upper()
+            color = (180, 180, 180)
 
-        cv2.putText(frame, label, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(frame, label, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
+        cv2.putText(frame, label, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
         return frame
 
-    def _process_landmarks(self, landmarks):
-        nose = landmarks[NOSE]
-        left_shoulder = landmarks[LEFT_SHOULDER]
-        right_shoulder = landmarks[RIGHT_SHOULDER]
+    def _extract_metrics(self, lms) -> Optional[dict]:
+        """Extract posture metrics from landmarks."""
+        nose, l_sh, r_sh = lms[NOSE], lms[LEFT_SHOULDER], lms[RIGHT_SHOULDER]
+        l_ear, r_ear = lms[LEFT_EAR], lms[RIGHT_EAR]
+        l_hip, r_hip = lms[LEFT_HIP], lms[RIGHT_HIP]
 
-        if nose.visibility < 0.5 or left_shoulder.visibility < 0.5 or right_shoulder.visibility < 0.5:
+        if any(lm.visibility < 0.4 for lm in [nose, l_sh, r_sh]):
+            return None
+
+        sh_mid_y = (l_sh.y + r_sh.y) / 2.0
+        sh_mid_x = (l_sh.x + r_sh.x) / 2.0
+
+        return {
+            "nose_to_shoulder_y": sh_mid_y - nose.y,
+            "head_tilt": abs(l_ear.y - r_ear.y) if l_ear.visibility > 0.4 and r_ear.visibility > 0.4 else 0,
+            "shoulder_asymmetry": abs(l_sh.y - r_sh.y),
+            "nose_x_offset": abs(nose.x - sh_mid_x),
+        }
+
+    def _analyze_posture(self, lms):
+        metrics = self._extract_metrics(lms)
+        if metrics is None:
             self._set_state("no_person")
             return
 
-        shoulder_mid_y = (left_shoulder.y + right_shoulder.y) / 2.0
-        nose_to_shoulder = shoulder_mid_y - nose.y
-
         if not self.calibrated:
-            self.calibration_samples.append(nose_to_shoulder)
+            self.calibration_samples.append(metrics)
             self.signals.calibration_progress.emit(len(self.calibration_samples), self.calibration_count)
 
             if len(self.calibration_samples) >= self.calibration_count:
-                self.baseline_ratio = sum(self.calibration_samples) / len(self.calibration_samples)
+                self.baseline = {}
+                for key in metrics:
+                    vals = [s[key] for s in self.calibration_samples]
+                    self.baseline[key] = sum(vals) / len(vals)
                 self.calibrated = True
                 self._set_state("good")
-                self.signals.log_message.emit(f"✅ Calibrated! Baseline: {self.baseline_ratio:.4f}")
+                self.signals.log_message.emit("✅ Calibrated!")
             return
 
-        deviation = self.baseline_ratio - nose_to_shoulder
-        self.current_deviation = deviation
+        # ── Step 1: Add to rolling buffer and compute smoothed metrics ──
+        self._metrics_buffer.append(metrics)
+        if len(self._metrics_buffer) > self._buffer_size:
+            self._metrics_buffer.pop(0)
 
-        if deviation > self.prefs.sensitivity:
-            if self.state != "slouching":
+        # Average over the buffer to smooth out momentary movements
+        smoothed = {}
+        for key in metrics:
+            smoothed[key] = sum(m[key] for m in self._metrics_buffer) / len(self._metrics_buffer)
+
+        # ── Step 2: Check for posture issues using smoothed values ──
+        issues = []
+
+        # Forward lean (head dropping toward shoulders)
+        dev = self.baseline["nose_to_shoulder_y"] - smoothed["nose_to_shoulder_y"]
+        if dev > self.prefs.sensitivity:
+            issues.append(("Forward Lean", dev))
+
+        # Head tilt
+        if self.prefs.detect_head_tilt:
+            tilt_dev = smoothed["head_tilt"] - self.baseline["head_tilt"]
+            if tilt_dev > self.prefs.head_tilt_threshold:
+                issues.append(("Head Tilt", tilt_dev))
+
+        # Shoulder asymmetry
+        if self.prefs.detect_shoulder_asymmetry:
+            asym_dev = smoothed["shoulder_asymmetry"] - self.baseline["shoulder_asymmetry"]
+            if asym_dev > self.prefs.shoulder_asym_threshold:
+                issues.append(("Uneven Shoulders", asym_dev))
+
+        max_dev = max((d for _, d in issues), default=0)
+        self.current_deviation = max_dev
+
+        # ── Step 3: Apply confirmation window + grace period ──
+        if issues:
+            worst_type = max(issues, key=lambda x: x[1])[0]
+            self._good_frames_in_slouch = 0  # reset grace counter
+
+            if self.state == "slouching":
+                # Already in slouch state — keep updating the type if it changed
+                self.logger.tick_bad_posture()
+                self._set_state("slouching", max_dev, worst_type)
+
+            elif self._bad_posture_since is None:
+                # First bad frame — start the confirmation timer
+                self._bad_posture_since = time.time()
+                # Don't change state yet — still in "good" visually
+                self._set_state("good", max_dev)
+
+            elif time.time() - self._bad_posture_since >= self._confirmation_seconds:
+                # Bad posture confirmed — it's been sustained long enough
                 self.slouch_start = time.time()
-                self.signals.log_message.emit(f"⚠️ Slouching! (dev: {deviation:.3f})")
-                self._trigger_alert()
-            self._set_state("slouching", deviation)
+                self.slouch_type = worst_type.lower().replace(" ", "_")
+                self.signals.log_message.emit(f"⚠️ {worst_type} detected (sustained {self._confirmation_seconds:.0f}s)")
+                if not self.prefs.focus_mode:
+                    self._trigger_alert()
+                self.logger.tick_bad_posture()
+                self._set_state("slouching", max_dev, worst_type)
+            else:
+                # Still in confirmation window — not yet triggered
+                self._set_state("good", max_dev)
+
         else:
-            if self.state == "slouching" and self.slouch_start is not None:
-                duration = time.time() - self.slouch_start
-                self.logger.log(duration)
-                self.slouch_start = None
-                self.signals.log_message.emit(f"✅ Corrected after {duration:.1f}s")
-            self._set_state("good", deviation)
+            # No issues detected on this frame
+            self._bad_posture_since = None  # reset confirmation timer
+
+            if self.state == "slouching":
+                # Currently in slouch — apply grace period before ending it
+                self._good_frames_in_slouch += 1
+
+                if self._good_frames_in_slouch >= self._grace_frames:
+                    # Sustained good posture — end the slouch
+                    if self.slouch_start is not None:
+                        dur = time.time() - self.slouch_start
+                        type_label = self.slouch_type.replace("_", " ").title()
+                        self.logger.log(dur, self.slouch_type)
+                        self.slouch_start = None
+                        self.signals.log_message.emit(f"✅ {type_label} corrected after {dur:.1f}s")
+                    self._good_frames_in_slouch = 0
+                    self.logger.tick_good_posture()
+                    self._set_state("good", max_dev)
+                else:
+                    # Still in grace period — stay in slouch state
+                    self.logger.tick_bad_posture()
+                    self._set_state("slouching", max_dev, self.current_posture_type)
+            else:
+                self.logger.tick_good_posture()
+                self._set_state("good", max_dev)
 
     def _trigger_alert(self):
         now = time.time()
@@ -375,169 +673,62 @@ class PostureMonitor:
             return
         self.last_alert_time = now
 
+        # Posture-type-specific messages
+        alert_messages = {
+            "forward_lean":      "You're leaning forward! Sit back and straighten up 🪑",
+            "head_tilt":         "Your head is tilting! Level it out 🧠",
+            "uneven_shoulders":  "Your shoulders are uneven! Balance them out 💪",
+        }
+        msg = alert_messages.get(self.slouch_type, "Check your posture! 🪑")
+
         if self.prefs.enable_sound:
-            subprocess.run(["afplay", "/System/Library/Sounds/Funk.aiff"], capture_output=True)
+            subprocess.Popen(["afplay", "/System/Library/Sounds/Funk.aiff"])
 
         if self.prefs.enable_notification:
-            script = 'display notification "You\'re slouching! Sit up straight 🪑" with title "PostureGuard" sound name "Funk"'
-            subprocess.run(["osascript", "-e", script], capture_output=True)
+            script = f'display notification "{msg}" with title "PostureGuard" sound name "Funk"'
+            subprocess.Popen(["osascript", "-e", script])
 
-    def _set_state(self, state: str, deviation: float = 0.0):
+    def _set_state(self, state: str, deviation: float = 0.0, posture_type: str = ""):
         self.state = state
         self.current_deviation = deviation
-        self.signals.state_changed.emit(state, deviation)
+        self.current_posture_type = posture_type
+        self.signals.state_changed.emit(state, deviation, posture_type)
 
 
 # ─────────────────────────────────────────────
 # Stylesheet
 # ─────────────────────────────────────────────
 
-STYLESHEET = """
-QMainWindow {
-    background-color: #1a1a2e;
-}
-QWidget {
-    color: #e0e0e0;
-    font-family: "SF Pro Display", "Helvetica Neue", sans-serif;
-}
-QTabWidget::pane {
-    border: 1px solid #2a2a4a;
-    background: #16163a;
-    border-radius: 8px;
-}
-QTabBar::tab {
-    background: #1a1a2e;
-    color: #888;
-    padding: 10px 20px;
-    border: none;
-    font-size: 13px;
-    font-weight: 600;
-}
-QTabBar::tab:selected {
-    color: #6cf;
-    border-bottom: 2px solid #6cf;
-}
-QTabBar::tab:hover {
-    color: #adf;
-}
-QPushButton {
-    background-color: #2a2a5a;
-    color: #e0e0e0;
-    border: 1px solid #3a3a6a;
-    border-radius: 8px;
-    padding: 10px 20px;
-    font-size: 13px;
-    font-weight: 600;
-}
-QPushButton:hover {
-    background-color: #3a3a7a;
-    border-color: #6cf;
-}
-QPushButton:pressed {
-    background-color: #1a1a4a;
-}
-QPushButton#startBtn {
-    background-color: #1a6a3a;
-    border-color: #2a8a4a;
-    font-size: 15px;
-    padding: 12px 30px;
-}
-QPushButton#startBtn:hover {
-    background-color: #2a8a4a;
-}
-QPushButton#stopBtn {
-    background-color: #6a1a1a;
-    border-color: #8a2a2a;
-    font-size: 15px;
-    padding: 12px 30px;
-}
-QPushButton#stopBtn:hover {
-    background-color: #8a2a2a;
-}
-QProgressBar {
-    border: 1px solid #2a2a4a;
-    border-radius: 6px;
-    background: #0e0e2a;
-    height: 14px;
-    text-align: center;
-    color: #aaa;
-    font-size: 10px;
-}
-QProgressBar::chunk {
-    border-radius: 5px;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2a7a5a, stop:1 #6cf);
-}
-QCheckBox {
-    font-size: 13px;
-    spacing: 8px;
-}
-QCheckBox::indicator {
-    width: 18px;
-    height: 18px;
-    border-radius: 4px;
-    border: 2px solid #3a3a6a;
-    background: #1a1a2e;
-}
-QCheckBox::indicator:checked {
-    background: #6cf;
-    border-color: #6cf;
-}
-QSlider::groove:horizontal {
-    height: 6px;
-    background: #2a2a4a;
-    border-radius: 3px;
-}
-QSlider::handle:horizontal {
-    width: 16px;
-    height: 16px;
-    margin: -5px 0;
-    background: #6cf;
-    border-radius: 8px;
-}
-QSlider::sub-page:horizontal {
-    background: #4a8abf;
-    border-radius: 3px;
-}
-QGroupBox {
-    border: 1px solid #2a2a4a;
-    border-radius: 8px;
-    margin-top: 12px;
-    padding-top: 20px;
-    font-size: 13px;
-    font-weight: 600;
-    color: #6cf;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 12px;
-    padding: 0 6px;
-}
-QLabel#statusLabel {
-    font-size: 16px;
-    font-weight: 700;
-    padding: 8px;
-}
-QLabel#bigStat {
-    font-size: 28px;
-    font-weight: 700;
-    color: #6cf;
-}
-QLabel#statLabel {
-    font-size: 11px;
-    color: #888;
-}
-QFrame#card {
-    background: #1e1e42;
-    border: 1px solid #2a2a4a;
-    border-radius: 10px;
-    padding: 12px;
-}
-QFrame#logFrame {
-    background: #0e0e1e;
-    border: 1px solid #1a1a3a;
-    border-radius: 6px;
-    padding: 8px;
-}
+STYLE = """
+QMainWindow { background: #12122a; }
+QWidget { color: #ddd; font-family: "SF Pro Display", "Helvetica Neue", sans-serif; }
+QTabWidget::pane { border: 1px solid #252550; background: #14143a; border-radius: 8px; }
+QTabBar::tab { background: #12122a; color: #777; padding: 9px 16px; border: none; font-size: 12px; font-weight: 600; }
+QTabBar::tab:selected { color: #6cf; border-bottom: 2px solid #6cf; }
+QTabBar::tab:hover { color: #ade; }
+QPushButton { background: #222258; color: #ddd; border: 1px solid #333370; border-radius: 7px; padding: 9px 18px; font-size: 12px; font-weight: 600; }
+QPushButton:hover { background: #333380; border-color: #6cf; }
+QPushButton#startBtn { background: #1a6a3a; border-color: #2a8a4a; font-size: 14px; padding: 11px 28px; }
+QPushButton#startBtn:hover { background: #2a8a4a; }
+QPushButton#stopBtn { background: #6a1a1a; border-color: #8a2a2a; font-size: 14px; padding: 11px 28px; }
+QPushButton#stopBtn:hover { background: #8a2a2a; }
+QPushButton#focusBtn { background: #5a3a8a; border-color: #7a5aaa; }
+QPushButton#focusBtn:hover { background: #7a5aaa; }
+QPushButton#focusBtnActive { background: #8a5a2a; border-color: #aa7a3a; }
+QProgressBar { border: 1px solid #252550; border-radius: 5px; background: #0c0c22; height: 12px; text-align: center; color: #999; font-size: 9px; }
+QProgressBar::chunk { border-radius: 4px; background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #2a7a5a,stop:1 #6cf); }
+QCheckBox { font-size: 12px; spacing: 6px; }
+QCheckBox::indicator { width: 16px; height: 16px; border-radius: 3px; border: 2px solid #333370; background: #12122a; }
+QCheckBox::indicator:checked { background: #6cf; border-color: #6cf; }
+QSlider::groove:horizontal { height: 5px; background: #252550; border-radius: 2px; }
+QSlider::handle:horizontal { width: 14px; height: 14px; margin: -5px 0; background: #6cf; border-radius: 7px; }
+QSlider::sub-page:horizontal { background: #4a8abf; border-radius: 2px; }
+QGroupBox { border: 1px solid #252550; border-radius: 7px; margin-top: 10px; padding-top: 18px; font-size: 12px; font-weight: 600; color: #6cf; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+QFrame#card { background: #1a1a42; border: 1px solid #252550; border-radius: 8px; padding: 10px; }
+QFrame#logFrame { background: #0a0a1a; border: 1px solid #181840; border-radius: 5px; padding: 6px; }
+QScrollArea { border: none; background: transparent; }
+QSpinBox { background: #1a1a3a; border: 1px solid #333370; border-radius: 4px; padding: 4px; color: #ddd; }
 """
 
 
@@ -549,14 +740,13 @@ class MainWindow(QMainWindow):
     def __init__(self, model_path: str):
         super().__init__()
         self.setWindowTitle("PostureGuard")
-        self.setFixedSize(520, 680)
-        self.setStyleSheet(STYLESHEET)
+        self.setFixedSize(560, 740)
+        self.setStyleSheet(STYLE)
 
         self.prefs = Preferences.load()
         self.logger = PostureLogger()
         self.monitor = PostureMonitor(self.prefs, self.logger, model_path)
 
-        # Connect signals
         self.monitor.signals.state_changed.connect(self._on_state_change)
         self.monitor.signals.frame_ready.connect(self._on_frame)
         self.monitor.signals.calibration_progress.connect(self._on_calibration)
@@ -564,306 +754,405 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._setup_tray()
+        self._setup_shortcuts()
+        self._setup_break_timer()
 
-        # Timer to refresh stats
         self.stats_timer = QTimer()
         self.stats_timer.timeout.connect(self._refresh_stats)
         self.stats_timer.start(5000)
 
     def _setup_tray(self):
-        """Set up system tray icon."""
         self.tray = QSystemTrayIcon(self)
-        # Create a simple colored icon
-        pixmap = QPixmap(32, 32)
-        pixmap.fill(QColor("#6cf"))
-        painter = QPainter(pixmap)
-        painter.setPen(QPen(QColor("#1a1a2e"), 2))
-        painter.setFont(QFont("Arial", 18))
-        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "🧍")
-        painter.end()
-        self.tray.setIcon(QIcon(pixmap))
-
-        tray_menu = QMenu()
-        show_action = QAction("Show PostureGuard", self)
-        show_action.triggered.connect(self.show)
-        tray_menu.addAction(show_action)
-        quit_action = QAction("Quit", self)
-        quit_action.triggered.connect(QApplication.quit)
-        tray_menu.addAction(quit_action)
-        self.tray.setContextMenu(tray_menu)
-        self.tray.activated.connect(self._tray_clicked)
+        px = QPixmap(32, 32)
+        px.fill(QColor(0, 0, 0, 0))
+        p = QPainter(px)
+        p.setFont(QFont("Arial", 20))
+        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "🧍")
+        p.end()
+        self.tray.setIcon(QIcon(px))
+        menu = QMenu()
+        menu.addAction("Show", self.show)
+        menu.addAction("Quit", QApplication.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(lambda r: self.show() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.show()
 
-    def _tray_clicked(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self.show()
-            self.raise_()
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+Shift+M"), self, self._toggle_monitoring)
+        QShortcut(QKeySequence("Ctrl+Shift+F"), self, self._toggle_focus_mode)
+        QShortcut(QKeySequence("Ctrl+Shift+R"), self, lambda: self.monitor.recalibrate() if self.monitor.running else None)
+
+    def _setup_break_timer(self):
+        self.break_timer = QTimer()
+        self.break_timer.timeout.connect(self._break_reminder)
+        self._update_break_timer()
+
+    def _update_break_timer(self):
+        if self.prefs.break_reminders_enabled and self.monitor.running:
+            self.break_timer.start(self.prefs.break_interval_minutes * 60 * 1000)
+        else:
+            self.break_timer.stop()
+
+    def _break_reminder(self):
+        if self.prefs.focus_mode:
+            return
+        subprocess.Popen(["osascript", "-e",
+            'display notification "Time to stand up and stretch! 🧘" with title "PostureGuard — Break Time" sound name "Glass"'])
+
+    def _toggle_monitoring(self):
+        if self.monitor.running:
+            self._stop_monitoring()
+        else:
+            self._start_monitoring()
+
+    def _toggle_focus_mode(self):
+        self.prefs.focus_mode = not self.prefs.focus_mode
+        self.monitor.prefs.focus_mode = self.prefs.focus_mode
+        self.prefs.save()
+        self._update_focus_btn()
+        self._on_log(f"{'🔕' if self.prefs.focus_mode else '🔔'} Focus mode {'ON' if self.prefs.focus_mode else 'OFF'}")
 
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(8)
+        ml = QVBoxLayout(central)
+        ml.setContentsMargins(10, 10, 10, 10)
+        ml.setSpacing(6)
 
-        # ── Header ──
-        header = QHBoxLayout()
+        # Header
+        hdr = QHBoxLayout()
         title = QLabel("PostureGuard")
-        title.setFont(QFont("SF Pro Display", 20, QFont.Weight.Bold))
+        title.setFont(QFont("SF Pro Display", 18, QFont.Weight.Bold))
         title.setStyleSheet("color: #6cf;")
-        header.addWidget(title)
+        hdr.addWidget(title)
+        hdr.addStretch()
 
-        header.addStretch()
+        self.score_label = QLabel("Score: —")
+        self.score_label.setStyleSheet("color: #4caf50; font-size: 14px; font-weight: 700;")
+        hdr.addWidget(self.score_label)
 
         self.status_dot = QLabel("●")
-        self.status_dot.setStyleSheet("color: #555; font-size: 18px;")
-        header.addWidget(self.status_dot)
-
+        self.status_dot.setStyleSheet("color: #555; font-size: 16px;")
+        hdr.addWidget(self.status_dot)
         self.status_label = QLabel("Not Monitoring")
-        self.status_label.setObjectName("statusLabel")
-        self.status_label.setStyleSheet("color: #888;")
-        header.addWidget(self.status_label)
+        self.status_label.setStyleSheet("color: #888; font-size: 13px; font-weight: 600;")
+        hdr.addWidget(self.status_label)
+        ml.addLayout(hdr)
 
-        main_layout.addLayout(header)
-
-        # ── Tabs ──
+        # Tabs
         tabs = QTabWidget()
-        tabs.addTab(self._create_monitor_tab(), "📷  Monitor")
-        tabs.addTab(self._create_stats_tab(), "📊  Stats")
-        tabs.addTab(self._create_settings_tab(), "⚙️  Settings")
-        main_layout.addWidget(tabs)
+        tabs.addTab(self._tab_monitor(), "📷 Monitor")
+        tabs.addTab(self._tab_stats(), "📊 Stats")
+        tabs.addTab(self._tab_achievements(), "🏆 Badges")
+        tabs.addTab(self._tab_settings(), "⚙️ Settings")
+        ml.addWidget(tabs)
+        self.tabs = tabs
 
     # ── Monitor Tab ──
 
-    def _create_monitor_tab(self) -> QWidget:
+    def _tab_monitor(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setSpacing(10)
+        ly = QVBoxLayout(tab)
+        ly.setSpacing(8)
 
-        # Camera preview
-        self.camera_label = QLabel()
-        self.camera_label.setFixedSize(480, 270)
-        self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.camera_label.setStyleSheet(
-            "background: #0a0a1a; border: 2px solid #2a2a4a; border-radius: 10px;"
-        )
-        self.camera_label.setText("Camera preview will appear here")
-        layout.addWidget(self.camera_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.cam_label = QLabel("Camera preview appears here")
+        self.cam_label.setFixedSize(520, 292)
+        self.cam_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cam_label.setStyleSheet("background: #08081a; border: 2px solid #252550; border-radius: 8px;")
+        ly.addWidget(self.cam_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Calibration progress
         self.cal_bar = QProgressBar()
         self.cal_bar.setRange(0, 20)
-        self.cal_bar.setValue(0)
-        self.cal_bar.setFormat("Calibration: %v/%m")
+        self.cal_bar.setFormat("Calibrating: %v/%m — sit up straight!")
         self.cal_bar.setVisible(False)
-        layout.addWidget(self.cal_bar)
+        ly.addWidget(self.cal_bar)
 
-        # Deviation meter
-        dev_layout = QHBoxLayout()
-        dev_layout.addWidget(QLabel("Posture deviation:"))
+        # Deviation + posture type
+        dev_row = QHBoxLayout()
+        dev_row.addWidget(QLabel("Deviation:"))
         self.dev_bar = QProgressBar()
         self.dev_bar.setRange(0, 100)
         self.dev_bar.setValue(0)
-        self.dev_bar.setFormat("%v%")
-        dev_layout.addWidget(self.dev_bar)
-        self.dev_value_label = QLabel("0.000")
-        self.dev_value_label.setStyleSheet("color: #6cf; font-family: monospace; font-size: 13px;")
-        dev_layout.addWidget(self.dev_value_label)
-        layout.addLayout(dev_layout)
+        dev_row.addWidget(self.dev_bar)
+        self.posture_type_label = QLabel("")
+        self.posture_type_label.setStyleSheet("color: #ff9800; font-size: 11px; font-weight: 600; min-width: 110px;")
+        dev_row.addWidget(self.posture_type_label)
+        ly.addLayout(dev_row)
 
-        # Quick stats row
-        stats_frame = QFrame()
-        stats_frame.setObjectName("card")
-        stats_row = QHBoxLayout(stats_frame)
+        # Stats cards
+        cards = QFrame()
+        cards.setObjectName("card")
+        cr = QHBoxLayout(cards)
+        self.today_count_lbl = QLabel("0")
+        self.today_count_lbl.setStyleSheet("font-size: 26px; font-weight: 700; color: #6cf;")
+        self.today_count_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.today_time_lbl = QLabel("0s")
+        self.today_time_lbl.setStyleSheet("font-size: 26px; font-weight: 700; color: #6cf;")
+        self.today_time_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.today_count_label = QLabel("0")
-        self.today_count_label.setObjectName("bigStat")
-        self.today_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        count_col = QVBoxLayout()
-        count_col.addWidget(self.today_count_label)
-        count_sub = QLabel("Slouches Today")
-        count_sub.setObjectName("statLabel")
-        count_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        count_col.addWidget(count_sub)
-        stats_row.addLayout(count_col)
+        for lbl, sub in [(self.today_count_lbl, "Slouches"), (self.today_time_lbl, "Total Time")]:
+            col = QVBoxLayout()
+            col.addWidget(lbl)
+            s = QLabel(sub)
+            s.setStyleSheet("font-size: 10px; color: #777;")
+            s.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(s)
+            cr.addLayout(col)
 
-        # Divider
-        div = QFrame()
-        div.setFrameShape(QFrame.Shape.VLine)
-        div.setStyleSheet("color: #2a2a4a;")
-        stats_row.addWidget(div)
+        ly.addWidget(cards)
 
-        self.today_time_label = QLabel("0s")
-        self.today_time_label.setObjectName("bigStat")
-        self.today_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        time_col = QVBoxLayout()
-        time_col.addWidget(self.today_time_label)
-        time_sub = QLabel("Total Slouch Time")
-        time_sub.setObjectName("statLabel")
-        time_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        time_col.addWidget(time_sub)
-        stats_row.addLayout(time_col)
-
-        layout.addWidget(stats_frame)
-
-        # Buttons
-        btn_layout = QHBoxLayout()
+        # Buttons row
+        btn_row = QHBoxLayout()
         self.start_btn = QPushButton("▶  Start Monitoring")
         self.start_btn.setObjectName("startBtn")
         self.start_btn.clicked.connect(self._start_monitoring)
-        btn_layout.addWidget(self.start_btn)
+        btn_row.addWidget(self.start_btn)
 
         self.stop_btn = QPushButton("⏹  Stop")
         self.stop_btn.setObjectName("stopBtn")
         self.stop_btn.clicked.connect(self._stop_monitoring)
         self.stop_btn.setVisible(False)
-        btn_layout.addWidget(self.stop_btn)
+        btn_row.addWidget(self.stop_btn)
 
         self.recal_btn = QPushButton("🔄 Recalibrate")
-        self.recal_btn.clicked.connect(self._recalibrate)
+        self.recal_btn.clicked.connect(lambda: self.monitor.recalibrate() if self.monitor.running else None)
         self.recal_btn.setVisible(False)
-        btn_layout.addWidget(self.recal_btn)
+        btn_row.addWidget(self.recal_btn)
 
-        layout.addLayout(btn_layout)
+        self.focus_btn = QPushButton("🔕 Focus Mode")
+        self.focus_btn.setObjectName("focusBtn")
+        self.focus_btn.clicked.connect(self._toggle_focus_mode)
+        self.focus_btn.setVisible(False)
+        btn_row.addWidget(self.focus_btn)
 
-        # Log area
-        log_frame = QFrame()
-        log_frame.setObjectName("logFrame")
-        log_layout = QVBoxLayout(log_frame)
-        log_layout.setContentsMargins(8, 4, 8, 4)
-        self.log_label = QLabel("Ready. Click Start Monitoring to begin.")
+        ly.addLayout(btn_row)
+
+        # Shortcut hints
+        hints = QLabel("Shortcuts:  Ctrl+Shift+M = toggle monitoring  |  Ctrl+Shift+F = focus mode  |  Ctrl+Shift+R = recalibrate")
+        hints.setStyleSheet("font-size: 9px; color: #555; padding: 2px;")
+        hints.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ly.addWidget(hints)
+
+        # Log
+        lf = QFrame()
+        lf.setObjectName("logFrame")
+        ll = QVBoxLayout(lf)
+        ll.setContentsMargins(6, 3, 6, 3)
+        self.log_label = QLabel("Ready. Press Start or Ctrl+Shift+M.")
         self.log_label.setWordWrap(True)
-        self.log_label.setStyleSheet("font-size: 11px; color: #888; font-family: monospace;")
-        self.log_label.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.log_label.setMinimumHeight(48)
-        log_layout.addWidget(self.log_label)
-        layout.addWidget(log_frame)
+        self.log_label.setStyleSheet("font-size: 10px; color: #777; font-family: monospace;")
+        self.log_label.setMinimumHeight(36)
+        ll.addWidget(self.log_label)
+        ly.addWidget(lf)
 
         return tab
 
     # ── Stats Tab ──
 
-    def _create_stats_tab(self) -> QWidget:
+    def _tab_stats(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setSpacing(12)
+        ly = QVBoxLayout(tab)
+        ly.setSpacing(10)
 
-        # Weekly chart
-        week_group = QGroupBox("Last 7 Days")
-        week_layout = QVBoxLayout(week_group)
-        self.week_bars_widget = QWidget()
-        self.week_bars_layout = QHBoxLayout(self.week_bars_widget)
-        self.week_bars_layout.setSpacing(6)
-        week_layout.addWidget(self.week_bars_widget)
-        layout.addWidget(week_group)
+        # Weekly bars
+        wg = QGroupBox("Last 7 Days")
+        wl = QVBoxLayout(wg)
+        self.week_widget = QWidget()
+        self.week_layout = QHBoxLayout(self.week_widget)
+        self.week_layout.setSpacing(4)
+        wl.addWidget(self.week_widget)
+        ly.addWidget(wg)
 
-        # Today's events
-        events_group = QGroupBox("Today's Events")
-        events_layout = QVBoxLayout(events_group)
+        # Heatmap
+        hg = QGroupBox("Today's Hourly Heatmap")
+        hl = QVBoxLayout(hg)
+        self.heatmap_widget = QWidget()
+        self.heatmap_widget.setFixedHeight(60)
+        hl.addWidget(self.heatmap_widget)
+        self.heatmap_widget.paintEvent = self._paint_heatmap
+        ly.addWidget(hg)
+
+        # Posture type breakdown
+        bg = QGroupBox("Slouch Types Today")
+        bl = QVBoxLayout(bg)
+        self.breakdown_label = QLabel("No data yet")
+        self.breakdown_label.setStyleSheet("font-size: 12px; color: #aaa; padding: 4px;")
+        bl.addWidget(self.breakdown_label)
+        ly.addWidget(bg)
+
+        # Events
+        eg = QGroupBox("Recent Events")
+        el = QVBoxLayout(eg)
         self.events_scroll = QScrollArea()
         self.events_scroll.setWidgetResizable(True)
-        self.events_scroll.setStyleSheet("border: none; background: transparent;")
         self.events_container = QWidget()
-        self.events_list_layout = QVBoxLayout(self.events_container)
-        self.events_list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.events_layout = QVBoxLayout(self.events_container)
+        self.events_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.events_scroll.setWidget(self.events_container)
-        events_layout.addWidget(self.events_scroll)
-        layout.addWidget(events_group)
+        self.events_scroll.setMaximumHeight(120)
+        el.addWidget(self.events_scroll)
+        ly.addWidget(eg)
 
-        clear_btn = QPushButton("🗑  Clear All Data")
-        clear_btn.clicked.connect(self._clear_data)
-        layout.addWidget(clear_btn)
+        # Export + clear
+        br = QHBoxLayout()
+        exp_btn = QPushButton("📄 Export CSV")
+        exp_btn.clicked.connect(self._export_csv)
+        br.addWidget(exp_btn)
+        clr_btn = QPushButton("🗑 Clear Data")
+        clr_btn.clicked.connect(lambda: (self.logger.clear(), self._refresh_stats()))
+        br.addWidget(clr_btn)
+        ly.addLayout(br)
 
         self._refresh_stats()
         return tab
 
+    # ── Achievements Tab ──
+
+    def _tab_achievements(self) -> QWidget:
+        tab = QWidget()
+        ly = QVBoxLayout(tab)
+        ly.setSpacing(8)
+
+        # Streak
+        streak_frame = QFrame()
+        streak_frame.setObjectName("card")
+        sl = QHBoxLayout(streak_frame)
+        self.streak_label = QLabel("0")
+        self.streak_label.setStyleSheet("font-size: 36px; font-weight: 700; color: #ff9800;")
+        sl.addWidget(self.streak_label)
+        sl2 = QVBoxLayout()
+        sl2.addWidget(QLabel("Day Streak"))
+        streak_sub = QLabel("Consecutive days with <10 min slouching")
+        streak_sub.setStyleSheet("font-size: 10px; color: #777;")
+        sl2.addWidget(streak_sub)
+        sl.addLayout(sl2)
+        sl.addStretch()
+        ly.addWidget(streak_frame)
+
+        # Badges grid
+        self.badges_scroll = QScrollArea()
+        self.badges_scroll.setWidgetResizable(True)
+        self.badges_container = QWidget()
+        self.badges_layout = QVBoxLayout(self.badges_container)
+        self.badges_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.badges_scroll.setWidget(self.badges_container)
+        ly.addWidget(self.badges_scroll)
+
+        self._refresh_achievements()
+        return tab
+
     # ── Settings Tab ──
 
-    def _create_settings_tab(self) -> QWidget:
+    def _tab_settings(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setSpacing(16)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        ly = QVBoxLayout(inner)
+        ly.setSpacing(12)
 
-        # Notifications
-        notif_group = QGroupBox("Alerts")
-        notif_layout = QVBoxLayout(notif_group)
-
-        self.notif_check = QCheckBox("macOS Notifications")
-        self.notif_check.setChecked(self.prefs.enable_notification)
-        self.notif_check.toggled.connect(lambda v: self._update_pref("enable_notification", v))
-        notif_layout.addWidget(self.notif_check)
-
-        self.sound_check = QCheckBox("Sound Alert (Funk)")
-        self.sound_check.setChecked(self.prefs.enable_sound)
-        self.sound_check.toggled.connect(lambda v: self._update_pref("enable_sound", v))
-        notif_layout.addWidget(self.sound_check)
-
+        # Alerts
+        ag = QGroupBox("Alerts")
+        al = QVBoxLayout(ag)
+        self.notif_chk = QCheckBox("macOS Notifications")
+        self.notif_chk.setChecked(self.prefs.enable_notification)
+        self.notif_chk.toggled.connect(lambda v: self._set_pref("enable_notification", v))
+        al.addWidget(self.notif_chk)
+        self.sound_chk = QCheckBox("Sound Alert")
+        self.sound_chk.setChecked(self.prefs.enable_sound)
+        self.sound_chk.toggled.connect(lambda v: self._set_pref("enable_sound", v))
+        al.addWidget(self.sound_chk)
         test_btn = QPushButton("🔔 Test Alert")
-        test_btn.clicked.connect(self._test_alert)
-        notif_layout.addWidget(test_btn)
+        test_btn.clicked.connect(lambda: subprocess.Popen(["afplay", "/System/Library/Sounds/Funk.aiff"]))
+        al.addWidget(test_btn)
+        ly.addWidget(ag)
 
-        layout.addWidget(notif_group)
+        # Detection types
+        dg = QGroupBox("Posture Detection")
+        dl = QVBoxLayout(dg)
+        self.skel_chk = QCheckBox("Show skeleton overlay on camera")
+        self.skel_chk.setChecked(self.prefs.show_skeleton)
+        self.skel_chk.toggled.connect(lambda v: self._set_pref("show_skeleton", v))
+        dl.addWidget(self.skel_chk)
+        self.tilt_chk = QCheckBox("Detect head tilt")
+        self.tilt_chk.setChecked(self.prefs.detect_head_tilt)
+        self.tilt_chk.toggled.connect(lambda v: self._set_pref("detect_head_tilt", v))
+        dl.addWidget(self.tilt_chk)
+        self.asym_chk = QCheckBox("Detect shoulder asymmetry")
+        self.asym_chk.setChecked(self.prefs.detect_shoulder_asymmetry)
+        self.asym_chk.toggled.connect(lambda v: self._set_pref("detect_shoulder_asymmetry", v))
+        dl.addWidget(self.asym_chk)
+        ly.addWidget(dg)
 
         # Sensitivity
-        sens_group = QGroupBox("Sensitivity")
-        sens_layout = QVBoxLayout(sens_group)
-
-        sens_header = QHBoxLayout()
-        sens_header.addWidget(QLabel("Slouch threshold:"))
-        self.sens_value_label = QLabel(self._sensitivity_label(self.prefs.sensitivity))
-        self.sens_value_label.setStyleSheet("color: #6cf; font-weight: 600;")
-        sens_header.addStretch()
-        sens_header.addWidget(self.sens_value_label)
-        sens_layout.addLayout(sens_header)
-
+        sg = QGroupBox("Sensitivity")
+        sgl = QVBoxLayout(sg)
+        sh = QHBoxLayout()
+        sh.addWidget(QLabel("Slouch threshold:"))
+        self.sens_lbl = QLabel(f"{self.prefs.sensitivity:.3f}")
+        self.sens_lbl.setStyleSheet("color: #6cf; font-weight: 600;")
+        sh.addStretch()
+        sh.addWidget(self.sens_lbl)
+        sgl.addLayout(sh)
         self.sens_slider = QSlider(Qt.Orientation.Horizontal)
-        self.sens_slider.setRange(20, 100)  # maps to 0.02–0.10
+        self.sens_slider.setRange(20, 100)
         self.sens_slider.setValue(int(self.prefs.sensitivity * 1000))
-        self.sens_slider.valueChanged.connect(self._on_sensitivity_change)
-        sens_layout.addWidget(self.sens_slider)
-
-        sens_hint_layout = QHBoxLayout()
-        hint_left = QLabel("More sensitive")
-        hint_left.setStyleSheet("font-size: 10px; color: #666;")
-        hint_right = QLabel("Less sensitive")
-        hint_right.setStyleSheet("font-size: 10px; color: #666;")
-        sens_hint_layout.addWidget(hint_left)
-        sens_hint_layout.addStretch()
-        sens_hint_layout.addWidget(hint_right)
-        sens_layout.addLayout(sens_hint_layout)
-
-        layout.addWidget(sens_group)
+        self.sens_slider.valueChanged.connect(self._on_sens)
+        sgl.addWidget(self.sens_slider)
+        hh = QHBoxLayout()
+        l1 = QLabel("More sensitive")
+        l1.setStyleSheet("font-size: 9px; color: #555;")
+        l2 = QLabel("Less sensitive")
+        l2.setStyleSheet("font-size: 9px; color: #555;")
+        hh.addWidget(l1); hh.addStretch(); hh.addWidget(l2)
+        sgl.addLayout(hh)
+        ly.addWidget(sg)
 
         # Cooldown
-        cd_group = QGroupBox("Alert Cooldown")
-        cd_layout = QVBoxLayout(cd_group)
-
-        cd_header = QHBoxLayout()
-        cd_header.addWidget(QLabel("Seconds between alerts:"))
-        self.cd_value_label = QLabel(f"{self.prefs.cooldown_seconds}s")
-        self.cd_value_label.setStyleSheet("color: #6cf; font-weight: 600;")
-        cd_header.addStretch()
-        cd_header.addWidget(self.cd_value_label)
-        cd_layout.addLayout(cd_header)
-
+        cg = QGroupBox("Alert Cooldown")
+        cl = QVBoxLayout(cg)
+        crr = QHBoxLayout()
+        crr.addWidget(QLabel("Seconds between alerts:"))
+        self.cd_lbl = QLabel(f"{self.prefs.cooldown_seconds}s")
+        self.cd_lbl.setStyleSheet("color: #6cf; font-weight: 600;")
+        crr.addStretch()
+        crr.addWidget(self.cd_lbl)
+        cl.addLayout(crr)
         self.cd_slider = QSlider(Qt.Orientation.Horizontal)
         self.cd_slider.setRange(10, 120)
         self.cd_slider.setValue(self.prefs.cooldown_seconds)
-        self.cd_slider.valueChanged.connect(self._on_cooldown_change)
-        cd_layout.addWidget(self.cd_slider)
+        self.cd_slider.valueChanged.connect(self._on_cd)
+        cl.addWidget(self.cd_slider)
+        ly.addWidget(cg)
 
-        layout.addWidget(cd_group)
+        # Break reminders
+        brg = QGroupBox("Break Reminders")
+        brl = QVBoxLayout(brg)
+        self.break_chk = QCheckBox("Remind me to stand up & stretch")
+        self.break_chk.setChecked(self.prefs.break_reminders_enabled)
+        self.break_chk.toggled.connect(lambda v: (self._set_pref("break_reminders_enabled", v), self._update_break_timer()))
+        brl.addWidget(self.break_chk)
+        bir = QHBoxLayout()
+        bir.addWidget(QLabel("Interval (minutes):"))
+        self.break_spin = QSpinBox()
+        self.break_spin.setRange(5, 120)
+        self.break_spin.setValue(self.prefs.break_interval_minutes)
+        self.break_spin.valueChanged.connect(lambda v: (self._set_pref("break_interval_minutes", v), self._update_break_timer()))
+        bir.addWidget(self.break_spin)
+        brl.addLayout(bir)
+        ly.addWidget(brg)
 
-        # Privacy note
-        privacy = QLabel(
-            "🔒 All processing happens on-device. No images or data are "
-            "transmitted. Camera frames are analyzed in memory and discarded."
-        )
-        privacy.setWordWrap(True)
-        privacy.setStyleSheet("font-size: 11px; color: #555; padding: 8px;")
-        layout.addWidget(privacy)
+        # Privacy
+        p = QLabel("🔒 All processing on-device. No data transmitted. Camera frames discarded after analysis.")
+        p.setWordWrap(True)
+        p.setStyleSheet("font-size: 10px; color: #444; padding: 6px;")
+        ly.addWidget(p)
+        ly.addStretch()
 
-        layout.addStretch()
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
         return tab
 
     # ── Actions ──
@@ -872,222 +1161,270 @@ class MainWindow(QMainWindow):
         self.start_btn.setVisible(False)
         self.stop_btn.setVisible(True)
         self.recal_btn.setVisible(True)
+        self.focus_btn.setVisible(True)
         self.cal_bar.setVisible(True)
         self.cal_bar.setValue(0)
         self.monitor.start()
+        self._update_break_timer()
 
     def _stop_monitoring(self):
         self.monitor.stop()
         self.start_btn.setVisible(True)
         self.stop_btn.setVisible(False)
         self.recal_btn.setVisible(False)
+        self.focus_btn.setVisible(False)
         self.cal_bar.setVisible(False)
-        self.camera_label.setText("Camera preview will appear here")
-        self.camera_label.setPixmap(QPixmap())
+        self.cam_label.setPixmap(QPixmap())
+        self.cam_label.setText("Camera preview appears here")
+        self.break_timer.stop()
         self._refresh_stats()
 
-    def _recalibrate(self):
-        self.cal_bar.setValue(0)
-        self.cal_bar.setVisible(True)
-        self.monitor.recalibrate()
+    def _update_focus_btn(self):
+        if self.prefs.focus_mode:
+            self.focus_btn.setText("🔔 Alerts On")
+            self.focus_btn.setObjectName("focusBtnActive")
+        else:
+            self.focus_btn.setText("🔕 Focus Mode")
+            self.focus_btn.setObjectName("focusBtn")
+        self.focus_btn.setStyleSheet(self.focus_btn.styleSheet())  # force refresh
 
-    def _test_alert(self):
-        if self.prefs.enable_sound:
-            subprocess.run(["afplay", "/System/Library/Sounds/Funk.aiff"], capture_output=True)
-        if self.prefs.enable_notification:
-            script = 'display notification "This is a test alert!" with title "PostureGuard" sound name "Funk"'
-            subprocess.run(["osascript", "-e", script], capture_output=True)
-
-    def _clear_data(self):
-        self.logger.clear()
-        self._refresh_stats()
+    def _export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "postureguard_export.csv", "CSV (*.csv)")
+        if path:
+            self.logger.export_csv(path)
+            self._on_log(f"📄 Exported to {path}")
 
     # ── Signal Handlers ──
 
-    def _on_state_change(self, state: str, deviation: float):
-        state_display = {
-            "inactive": ("Not Monitoring", "#555"),
-            "calibrating": ("Calibrating — sit straight!", "#ffaa00"),
-            "good": ("Good Posture ✓", "#4caf50"),
-            "slouching": ("Slouching!", "#f44336"),
-            "no_person": ("No Person Detected", "#888"),
+    def _on_state_change(self, state: str, deviation: float, posture_type: str):
+        display = {
+            "inactive":    ("Not Monitoring",  "#555"),
+            "calibrating": ("Calibrating...",   "#ffaa00"),
+            "good":        ("Good Posture ✓",   "#4caf50"),
+            "no_person":   ("No Person",        "#888"),
         }
-        text, color = state_display.get(state, ("Unknown", "#888"))
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(f"color: {color};")
-        self.status_dot.setStyleSheet(f"color: {color}; font-size: 18px;")
 
-        # Update deviation bar
-        dev_pct = min(int(abs(deviation) / 0.15 * 100), 100) if self.monitor.calibrated else 0
-        self.dev_bar.setValue(dev_pct)
-        self.dev_value_label.setText(f"{deviation:.3f}")
-
-        if dev_pct < 40:
-            self.dev_bar.setStyleSheet("QProgressBar::chunk { background: #4caf50; border-radius: 5px; }")
-        elif dev_pct < 70:
-            self.dev_bar.setStyleSheet("QProgressBar::chunk { background: #ff9800; border-radius: 5px; }")
+        if state == "slouching" and posture_type:
+            # Use the specific posture issue as the status text
+            type_display = {
+                "Forward Lean":      ("Forward Lean ↘",       "#f44336"),
+                "Head Tilt":         ("Head Tilting ↗",       "#ff6600"),
+                "Uneven Shoulders":  ("Uneven Shoulders ⤵",  "#e65100"),
+            }
+            text, color = type_display.get(posture_type, ("Bad Posture", "#f44336"))
+        elif state == "slouching":
+            text, color = "Bad Posture", "#f44336"
         else:
-            self.dev_bar.setStyleSheet("QProgressBar::chunk { background: #f44336; border-radius: 5px; }")
+            text, color = display.get(state, ("Unknown", "#888"))
 
-        # Update tray tooltip
-        self.tray.setToolTip(f"PostureGuard — {text}")
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}; font-size: 13px; font-weight: 600;")
+        self.status_dot.setStyleSheet(f"color: {color}; font-size: 16px;")
 
-        # Refresh stats periodically
-        self._refresh_stats()
+        self.posture_type_label.setText(posture_type if state == "slouching" else "")
+
+        pct = min(int(abs(deviation) / 0.15 * 100), 100) if self.monitor.calibrated else 0
+        self.dev_bar.setValue(pct)
+        chunk_color = "#4caf50" if pct < 40 else "#ff9800" if pct < 70 else "#f44336"
+        self.dev_bar.setStyleSheet(f"QProgressBar::chunk {{ background: {chunk_color}; border-radius: 4px; }}")
+
+        score = self.logger.daily_score()
+        sc = "#4caf50" if score > 80 else "#ff9800" if score > 50 else "#f44336"
+        self.score_label.setText(f"Score: {score:.0f}%")
+        self.score_label.setStyleSheet(f"color: {sc}; font-size: 14px; font-weight: 700;")
 
     def _on_frame(self, frame: np.ndarray):
-        """Display camera frame in the preview label."""
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-        scaled = pixmap.scaled(
-            self.camera_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        self.camera_label.setPixmap(scaled)
+        img = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        px = QPixmap.fromImage(img).scaled(self.cam_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self.cam_label.setPixmap(px)
 
-    def _on_calibration(self, current: int, total: int):
+    def _on_calibration(self, cur: int, total: int):
         self.cal_bar.setRange(0, total)
-        self.cal_bar.setValue(current)
-        if current >= total:
+        self.cal_bar.setValue(cur)
+        if cur >= total:
             self.cal_bar.setVisible(False)
 
-    def _on_log(self, message: str):
-        # Show last 3 lines
-        current = self.log_label.text()
-        lines = current.split("\n")
-        lines.append(message)
+    def _on_log(self, msg: str):
+        lines = self.log_label.text().split("\n")
+        lines.append(msg)
         self.log_label.setText("\n".join(lines[-3:]))
 
-    # ── Settings Handlers ──
+    # ── Settings Helpers ──
 
-    def _update_pref(self, key: str, value):
-        setattr(self.prefs, key, value)
-        self.monitor.prefs = self.prefs
+    def _set_pref(self, key: str, val):
+        setattr(self.prefs, key, val)
+        setattr(self.monitor.prefs, key, val)
         self.prefs.save()
 
-    def _on_sensitivity_change(self, value: int):
-        sens = value / 1000.0
-        self.prefs.sensitivity = sens
-        self.monitor.prefs.sensitivity = sens
-        self.sens_value_label.setText(self._sensitivity_label(sens))
-        self.prefs.save()
+    def _on_sens(self, v):
+        s = v / 1000.0
+        self._set_pref("sensitivity", s)
+        self.sens_lbl.setText(f"{s:.3f}")
 
-    def _on_cooldown_change(self, value: int):
-        self.prefs.cooldown_seconds = value
-        self.monitor.prefs.cooldown_seconds = value
-        self.cd_value_label.setText(f"{value}s")
-        self.prefs.save()
-
-    @staticmethod
-    def _sensitivity_label(val: float) -> str:
-        if val < 0.03:
-            return "Very High (0.{:.0f})".format(val * 100)
-        if val < 0.05:
-            return "High ({:.3f})".format(val)
-        if val < 0.07:
-            return "Medium ({:.3f})".format(val)
-        return "Low ({:.3f})".format(val)
+    def _on_cd(self, v):
+        self._set_pref("cooldown_seconds", v)
+        self.cd_lbl.setText(f"{v}s")
 
     # ── Stats Refresh ──
 
     def _refresh_stats(self):
         count, total = self.logger.today_stats()
-        self.today_count_label.setText(str(count))
-        self.today_time_label.setText(self._fmt(total))
+        self.today_count_lbl.setText(str(count))
+        self.today_time_lbl.setText(self._fmt(total))
 
         # Weekly bars
-        while self.week_bars_layout.count():
-            child = self.week_bars_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+        while self.week_layout.count():
+            c = self.week_layout.takeAt(0)
+            if c.widget(): c.widget().deleteLater()
 
         weekly = self.logger.weekly_stats()
-        max_total = max((s[2] for s in weekly), default=1) or 1
-
-        for day_label, day_count, day_total in weekly:
+        mx = max((s[2] for s in weekly), default=1) or 1
+        for dl, dc, dt in weekly:
             col = QVBoxLayout()
             col.setAlignment(Qt.AlignmentFlag.AlignBottom)
-
-            # Value label
-            val = QLabel(self._fmt(day_total) if day_total > 0 else "—")
-            val.setStyleSheet("font-size: 9px; color: #888;")
-            val.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            col.addWidget(val)
-
-            # Bar
-            bar_height = max(4, int(day_total / max_total * 80)) if day_total > 0 else 4
-            if day_total == 0:
-                bar_color = "#2a2a4a"
-            elif day_total < 300:
-                bar_color = "#4caf50"
-            elif day_total < 900:
-                bar_color = "#ff9800"
-            else:
-                bar_color = "#f44336"
-
+            v = QLabel(self._fmt(dt) if dt else "—")
+            v.setStyleSheet("font-size: 8px; color: #777;")
+            v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(v)
+            bh = max(4, int(dt / mx * 70)) if dt else 4
+            bc = "#2a2a4a" if not dt else "#4caf50" if dt < 300 else "#ff9800" if dt < 900 else "#f44336"
             bar = QFrame()
-            bar.setFixedSize(40, bar_height)
-            bar.setStyleSheet(f"background: {bar_color}; border-radius: 4px;")
+            bar.setFixedSize(35, bh)
+            bar.setStyleSheet(f"background: {bc}; border-radius: 3px;")
             col.addWidget(bar, alignment=Qt.AlignmentFlag.AlignCenter)
+            d = QLabel(dl)
+            d.setStyleSheet("font-size: 10px; color: #999;")
+            d.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(d)
+            w = QWidget()
+            w.setLayout(col)
+            self.week_layout.addWidget(w)
 
-            # Day label
-            day = QLabel(day_label)
-            day.setStyleSheet("font-size: 11px; color: #aaa;")
-            day.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            col.addWidget(day)
-
-            wrapper = QWidget()
-            wrapper.setLayout(col)
-            self.week_bars_layout.addWidget(wrapper)
-
-        # Today's events list
-        while self.events_list_layout.count():
-            child = self.events_list_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-
-        events = self.logger.today_events()
-        if not events:
-            empty = QLabel("No slouching events today ✨")
-            empty.setStyleSheet("color: #555; font-size: 12px; padding: 16px;")
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.events_list_layout.addWidget(empty)
+        # Breakdown
+        bd = self.logger.posture_type_breakdown()
+        if bd:
+            parts = [f"{k.replace('_', ' ').title()}: {self._fmt(v)}" for k, v in bd.items()]
+            self.breakdown_label.setText("  •  ".join(parts))
         else:
-            for event in reversed(events[-15:]):
-                t = datetime.fromisoformat(event.timestamp).strftime("%H:%M")
-                row = QLabel(f"  ⚠️  {t}    →    {event.formatted_duration}")
-                row.setStyleSheet(
-                    "font-size: 12px; color: #ccc; padding: 4px 8px; "
-                    "background: #1a1a3a; border-radius: 4px; margin: 2px 0;"
-                )
-                self.events_list_layout.addWidget(row)
+            self.breakdown_label.setText("No data yet")
+
+        # Events list
+        while self.events_layout.count():
+            c = self.events_layout.takeAt(0)
+            if c.widget(): c.widget().deleteLater()
+
+        evts = self.logger.today_events()
+        if not evts:
+            el = QLabel("No events today ✨")
+            el.setStyleSheet("color: #555; font-size: 11px; padding: 10px;")
+            el.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.events_layout.addWidget(el)
+        else:
+            for e in reversed(evts[-12:]):
+                t = datetime.fromisoformat(e.timestamp).strftime("%H:%M")
+                tp = e.posture_type.replace("_", " ").title() if e.posture_type != "general" else ""
+                txt = f"⚠️ {t}  →  {e.formatted_duration}"
+                if tp:
+                    txt += f"  ({tp})"
+                r = QLabel(txt)
+                r.setStyleSheet("font-size: 11px; color: #bbb; background: #16163a; border-radius: 3px; padding: 3px 6px; margin: 1px 0;")
+                self.events_layout.addWidget(r)
+
+        # Heatmap repaint
+        self.heatmap_widget.update()
+
+        # Achievements
+        self._refresh_achievements()
+
+    def _refresh_achievements(self):
+        if not hasattr(self, 'badges_layout'):
+            return
+        while self.badges_layout.count():
+            c = self.badges_layout.takeAt(0)
+            if c.widget(): c.widget().deleteLater()
+
+        self.streak_label.setText(str(self.logger.streak_days()))
+
+        for ach in ACHIEVEMENTS:
+            unlocked = ach["id"] in self.logger.unlocked_achievements
+            frame = QFrame()
+            frame.setObjectName("card")
+            row = QHBoxLayout(frame)
+
+            icon = QLabel(ach["icon"])
+            icon.setStyleSheet(f"font-size: 24px; {'opacity: 1' if unlocked else 'opacity: 0.3'};")
+            row.addWidget(icon)
+
+            info = QVBoxLayout()
+            name = QLabel(ach["name"])
+            name.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {'#6cf' if unlocked else '#555'};")
+            info.addWidget(name)
+            desc = QLabel(ach["desc"])
+            desc.setStyleSheet(f"font-size: 10px; color: {'#aaa' if unlocked else '#444'};")
+            info.addWidget(desc)
+            row.addLayout(info)
+            row.addStretch()
+
+            status = QLabel("✅ Unlocked" if unlocked else "🔒 Locked")
+            status.setStyleSheet(f"font-size: 10px; color: {'#4caf50' if unlocked else '#555'};")
+            row.addWidget(status)
+
+            self.badges_layout.addWidget(frame)
+
+    # ── Heatmap Painting ──
+
+    def _paint_heatmap(self, event):
+        w = self.heatmap_widget
+        painter = QPainter(w)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        hours = self.logger.hourly_heatmap()
+        mx = max(hours) if max(hours) > 0 else 1
+        cell_w = (w.width() - 20) / 24
+        cell_h = 28
+        y = 8
+
+        for i, val in enumerate(hours):
+            x = 10 + i * cell_w
+            intensity = val / mx if mx > 0 else 0
+
+            if val == 0:
+                color = QColor(30, 30, 60)
+            else:
+                r = int(50 + intensity * 200)
+                g = int(200 - intensity * 150)
+                b = int(80 - intensity * 60)
+                color = QColor(min(r, 255), max(g, 0), max(b, 0))
+
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(QColor(20, 20, 50), 1))
+            painter.drawRoundedRect(int(x), y, int(cell_w - 1), cell_h, 3, 3)
+
+            # Hour labels (every 3 hours)
+            if i % 3 == 0:
+                painter.setPen(QColor(120, 120, 120))
+                painter.setFont(QFont("Helvetica", 8))
+                painter.drawText(int(x), y + cell_h + 14, f"{i:02d}")
+
+        painter.end()
+
+    # ── Utilities ──
 
     @staticmethod
-    def _fmt(seconds: float) -> str:
-        m, s = divmod(int(seconds), 60)
+    def _fmt(s: float) -> str:
+        m, sec = divmod(int(s), 60)
         h, m = divmod(m, 60)
-        if h > 0:
-            return f"{h}h {m}m"
-        if m > 0:
-            return f"{m}m {s}s"
-        return f"{s}s"
-
-    # ── Window Events ──
+        if h: return f"{h}h {m}m"
+        if m: return f"{m}m {sec}s"
+        return f"{sec}s"
 
     def closeEvent(self, event):
-        """Minimize to tray instead of quitting."""
         event.ignore()
         self.hide()
-        self.tray.showMessage(
-            "PostureGuard",
-            "Running in the background. Click the tray icon to reopen.",
-            QSystemTrayIcon.MessageIcon.Information,
-            2000,
-        )
+        self.tray.showMessage("PostureGuard", "Running in background. Click tray to reopen.",
+                              QSystemTrayIcon.MessageIcon.Information, 2000)
 
 
 # ─────────────────────────────────────────────
@@ -1095,52 +1432,76 @@ class MainWindow(QMainWindow):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Dependency check
+    import logging
+
+    # Set up logging to file (useful when running as .app without a terminal)
+    log_dir = os.path.expanduser("~/.postureguard")
+    os.makedirs(log_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, "app.log")),
+            logging.StreamHandler(sys.stdout),
+        ]
+    )
+    log = logging.getLogger("PostureGuard")
+
     missing = []
-    try:
-        import cv2
-    except ImportError:
-        missing.append("opencv-python")
-    try:
-        import mediapipe
-    except ImportError:
-        missing.append("mediapipe")
-    try:
-        from PyQt6.QtWidgets import QApplication
-    except ImportError:
-        missing.append("PyQt6")
-
+    for mod in ["cv2", "mediapipe", "PyQt6"]:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod if mod != "cv2" else "opencv-python")
     if missing:
-        print(f"\n❌ Missing: {', '.join(missing)}")
-        print(f"Run:  pip install {' '.join(missing)}\n")
+        log.error(f"Missing: {', '.join(missing)}")
+        # If PyQt6 is available, show a dialog; otherwise just print
+        try:
+            from PyQt6.QtWidgets import QApplication, QMessageBox
+            app = QApplication(sys.argv)
+            QMessageBox.critical(None, "PostureGuard", f"Missing dependencies: {', '.join(missing)}\n\nRun: pip install {' '.join(missing)}")
+        except Exception:
+            pass
         sys.exit(1)
 
-    print("🧍 PostureGuard starting...\n")
+    log.info("PostureGuard v2 starting...")
 
-    # Request camera on main thread
-    print("📷 Requesting camera access...")
+    # Camera auth on main thread (required by macOS)
     os.environ["OPENCV_AVFOUNDATION_SKIP_AUTH"] = "0"
-    test_cap = cv2.VideoCapture(0)
-    if test_cap.isOpened():
-        ret, frame = test_cap.read()
+    cap = cv2.VideoCapture(0)
+    camera_ok = False
+    if cap.isOpened():
+        ret, f = cap.read()
         if ret:
-            print(f"✅ Camera OK ({frame.shape[1]}x{frame.shape[0]})")
-        test_cap.release()
+            log.info(f"Camera OK ({f.shape[1]}x{f.shape[0]})")
+            camera_ok = True
+        cap.release()
     else:
-        test_cap.release()
-        print("❌ Camera access denied!")
-        print(f"   Grant camera access to: {sys.executable}")
-        print("   System Settings → Privacy & Security → Camera")
+        cap.release()
+
+    if not camera_ok:
+        log.error("Camera access denied")
+        try:
+            from PyQt6.QtWidgets import QApplication, QMessageBox
+            app = QApplication(sys.argv)
+            QMessageBox.warning(None, "PostureGuard — Camera Access",
+                f"Camera access was denied.\n\n"
+                f"Please grant camera permission:\n"
+                f"  System Settings → Privacy & Security → Camera\n\n"
+                f"Look for: {sys.executable}\n\n"
+                f"Then relaunch PostureGuard.")
+        except Exception:
+            pass
         sys.exit(1)
 
-    # Download model
     model_path = ensure_model()
 
-    # Launch GUI
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)  # keep running in tray
+    app.setApplicationName("PostureGuard")
+    app.setQuitOnLastWindowClosed(False)  # keep running in tray when window is closed
 
-    window = MainWindow(model_path)
-    window.show()
+    win = MainWindow(model_path)
+    win.show()
 
+    log.info("App ready.")
     sys.exit(app.exec())
